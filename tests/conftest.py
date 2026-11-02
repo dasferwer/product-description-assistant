@@ -21,12 +21,12 @@ def product():
 @pytest.fixture
 def draft(product):
     def claim(text, source="description", quote=None):
-        return {"text": text, "sources": [{"field": source, "quote": quote or text}]}
+        return {"text": text, "sources": [source]}
 
     return {
         "status": "ready",
         "seo_title": claim(product["name"], "name"),
-        "seo_description": [claim(product["description"])],
+        "seo_description": claim(product["description"]),
         "search_queries": [
             claim(product["name"], "name"),
             claim("измерения избыточного давления воздуха"),

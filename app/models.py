@@ -1,3 +1,4 @@
+import json
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -17,6 +18,12 @@ class StrictModel(BaseModel):
 Scalar = str | int | float | bool | None
 
 
+def unknown(value: Scalar) -> bool:
+    return value is None or (isinstance(value, str) and value.strip().casefold() in {
+        "", "данных нет", "нет данных", "не указано", "n/a", "-",
+    })
+
+
 class Product(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
@@ -24,6 +31,14 @@ class Product(BaseModel):
     manufacturer: str = Field(max_length=200)
     specs: dict[str, Scalar] = Field(max_length=50)
     description: str = Field(max_length=20000)
+
+    def source_fields(self) -> dict[str, str]:
+        return {
+            "name": self.name, "manufacturer": self.manufacturer,
+            "description": self.description,
+            **{f"specs/{key}": value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+               for key, value in self.specs.items() if not unknown(value)},
+        }
 
     @field_validator("specs")
     @classmethod
@@ -43,7 +58,11 @@ class Reference(StrictModel):
 
 class Claim(StrictModel):
     text: str = Field(min_length=1, max_length=2000)
-    sources: list[Reference] = Field(min_length=1, max_length=8)
+    sources: list[str] = Field(min_length=1, max_length=8)
+
+
+class DescriptionClaim(Claim):
+    text: str = Field(min_length=800, max_length=1200)
 
 
 class MissingData(StrictModel):
@@ -51,6 +70,13 @@ class MissingData(StrictModel):
     message: str = Field(min_length=1, max_length=600)
     question: str = Field(min_length=1, max_length=400)
     blocking: bool
+
+    @field_validator("field")
+    @classmethod
+    def input_field_only(cls, value: str) -> str:
+        if value not in {"name", "manufacturer", "description"} and not (value.startswith("specs/") and len(value) > 6):
+            raise ValueError("Вопрос должен относиться к входным данным товара, а не к полям ответа модели.")
+        return value
 
 
 class Conflict(StrictModel):
@@ -68,7 +94,7 @@ class ExtractedCharacteristic(StrictModel):
 class Draft(StrictModel):
     status: Literal["ready", "needs_clarification"]
     seo_title: Claim | None
-    seo_description: list[Claim] = Field(max_length=12)
+    seo_description: DescriptionClaim | None
     search_queries: list[Claim] = Field(max_length=5)
     audience: Claim | None
     tasks: Claim | None

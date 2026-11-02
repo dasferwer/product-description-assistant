@@ -6,23 +6,22 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from openai import AsyncOpenAI
+from ollama import AsyncClient
 
 from app.models import GenerationResponse, Product
-from app.provider import OpenAIGateway, ServiceError
+from app.provider import OllamaGateway, ServiceError
 from app.service import generate
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_dotenv(".env", override=False)
-    key = os.getenv("OPENAI_API_KEY", "").strip()
-    model = os.getenv("OPENAI_MODEL", "").strip()
+    host = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").strip()
+    model = os.getenv("OLLAMA_MODEL", "").strip()
     app.state.gateway = None
-    if key and model:
-        async with AsyncOpenAI(api_key=key, base_url="https://api.openai.com/v1",
-                               timeout=30.0, max_retries=0) as client:
-            app.state.gateway = OpenAIGateway(client, model)
+    if host and model:
+        async with AsyncClient(host=host, timeout=110.0) as client:
+            app.state.gateway = OllamaGateway(client, model)
             yield
     else:
         yield
@@ -31,7 +30,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Помощник товарных описаний", version="1.0.0", lifespan=lifespan)
 
 
-def get_gateway(request: Request) -> OpenAIGateway | None:
+def get_gateway(request: Request) -> OllamaGateway | None:
     return request.app.state.gateway
 
 
@@ -50,9 +49,9 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
 
 @app.post("/generate", response_model=GenerationResponse)
-async def generate_card(product: Product, gateway: OpenAIGateway | None = Depends(get_gateway)) -> GenerationResponse:
+async def generate_card(product: Product, gateway: OllamaGateway | None = Depends(get_gateway)) -> GenerationResponse:
     try:
-        async with asyncio.timeout(150):
+        async with asyncio.timeout(480):
             return await generate(product, gateway)
     except TimeoutError as exc:
         raise ServiceError(504, "request_timeout", "Превышено общее время подготовки карточки.") from exc

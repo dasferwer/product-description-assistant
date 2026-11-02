@@ -1,26 +1,10 @@
-import json
 import re
 
 from app.models import (
     Characteristic, ClarificationResponse, Commercial, Conflict, Draft,
-    GenerationResponse, Lengths, MissingData, Product, ReadyResponse, Reference, Scalar,
+    GenerationResponse, Lengths, MissingData, Product, ReadyResponse, Reference, unknown,
 )
-from app.provider import InvalidOutput, OpenAIGateway, ServiceError
-
-
-def unknown(value: Scalar) -> bool:
-    return value is None or (isinstance(value, str) and value.strip().casefold() in {
-        "", "данных нет", "нет данных", "не указано", "n/a", "-",
-    })
-
-
-def source_fields(product: Product) -> dict[str, str]:
-    return {
-        "name": product.name, "manufacturer": product.manufacturer,
-        "description": product.description,
-        **{f"specs/{key}": value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-           for key, value in product.specs.items() if not unknown(value)},
-    }
+from app.provider import InvalidOutput, OllamaGateway, ServiceError
 
 
 def check_reference(reference: Reference, sources: dict[str, str]) -> None:
@@ -41,32 +25,82 @@ def check_conflicts(conflicts: list[Conflict], sources: dict[str, str]) -> None:
 
 
 # Это фильтр числовых фрагментов, а не доказательство технического смысла.
-NUMBER = r"[+−-]?\d+(?:[.,]\d+)?(?:/\d+)?(?:\s*[–−-]\s*[+−-]?\d+(?:[.,]\d+)?)?"
+INTEGER = r"\d+(?:[ \u00a0\u202f]\d{3}(?!\d))*"
+DECIMAL = INTEGER + r"(?:[.,]\d+)?(?:/\d+)?"
+NUMBER = rf"[±+−-]?{DECIMAL}(?:\s*(?:[–−-]|…|\.{{2,3}})\s*[±+−-]?{DECIMAL})?"
 UNITS = (
-    r"%|°\s*[CСF]|МПа|кПа|Па|MPa|kPa|Pa|бар|bar|psi|мм|см|мкм|mm|cm|µm|"
+    r"%\s*RH(?:/K)?|%|°\s*[CСF]|МПа|кПа|Па|MPa|kPa|Pa|бар|bar|psi|мм|см|мкм|mm|cm|µm|"
     r"кг|мг|г|kg|mg|мВ|кВ|В|mV|kV|V|мА|А|mA|A|кВт|Вт|kW|W|МГц|кГц|Гц|MHz|kHz|Hz|"
-    r"кОм|Ом|Ω|л/мин|мл/мин|м/с|об/мин|л|мл|м|m|с|s"
+    r"кОм|Ом|Ω|л/мин|мл/мин|м/с|об/мин|л|мл|м|m|мин|ч|дней|дня|год|года|лет|min|h|с|s"
 )
 QUANTITY = re.compile(NUMBER + rf"(?:\s*(?:{UNITS})(?!\w))?")
+SENSITIVE_WORDS = re.compile(
+    r"\b(обеспеч|гарант|повыш|сниж|предотвращ|безопас|надеж|эффектив|оптималь|"
+    r"сертиф|совместим|агрессив|взрыв|вибрац|коррози|нержав|энерг|"
+    r"пыл|влаг|водонепрониц|термостой|налич)\w*"
+)
+
+
+def check_sensitive_claim(text: str, evidence: str) -> None:
+    software = r"\bпрограмм\w+\s+обеспеч\w+\b"
+    normalized = re.sub(software, "", evidence.casefold().replace("ё", "е"))
+    checked = re.sub(software, "", text.casefold().replace("ё", "е"))
+    for match in SENSITIVE_WORDS.finditer(checked):
+        # Сверяются основы слов; склонение не меняет наличие свойства во входе.
+        root = match.group(1)
+        if root not in normalized:
+            raise InvalidOutput(f"Удали неподтверждённое утверждение «{match.group()}»: во входных данных этого свойства или результата нет.")
+
+
+NEGATIONS = (
+    re.compile(r"\bне\s+((?:подходит|предназначен\w*|рекомендуется)\s+(?:для|в)\s+[^.!?;\n]+)"),
+    re.compile(r"\bнельзя\s+((?:применять|использовать)\s+(?:для|в)\s+[^.!?;\n]+)"),
+)
+
+
+def check_identity_and_negation(product: Product, text: str) -> None:
+    known = re.sub(r"[\W_]+", "", product.manufacturer.casefold())
+    for match in re.finditer(r"\b(?:производитель|изготовитель)\s*[:—]\s*([^.;\n]+)", text, re.IGNORECASE):
+        declared = re.sub(r"[\W_]+", "", match.group(1).casefold())
+        if declared and declared not in known:
+            raise InvalidOutput("Производитель в тексте не соответствует входному manufacturer.")
+    source = re.sub(r"\s+", " ", product.description.casefold())
+    positive = re.sub(r"\s+", " ", text.casefold())
+    for pattern in NEGATIONS:
+        positive = pattern.sub("", positive)
+    for pattern in NEGATIONS:
+        for match in pattern.finditer(source):
+            if match.group(1) in positive:
+                raise InvalidOutput("Утверждение меняет смысл явного запрета из описания.")
 
 
 def check_draft(product: Product, draft: Draft) -> None:
-    sources = source_fields(product)
+    sources = product.source_fields()
+    if draft.status == "ready":
+        description_length = len(draft.seo_description.text) if draft.seo_description else 0
+        if not 800 <= description_length <= 1200:
+            raise InvalidOutput(f"SEO-описание содержит {description_length} символов. Нужны 800–1200: напиши полный связный текст по исходным фактам.")
     check_conflicts(draft.conflicts, sources)
-    claims = [c for c in [draft.seo_title, *draft.seo_description,
+    claims = [c for c in [draft.seo_title, draft.seo_description,
                          *draft.search_queries, draft.audience, draft.tasks] if c is not None]
+    evidence_text = " ".join(f"{field}: {value}" for field, value in sources.items())
+    evidence = {re.sub(r"\s+", "", match.group())
+                for value in sources.values() for match in QUANTITY.finditer(value)}
     for claim in claims:
-        for reference in claim.sources:
-            check_reference(reference, sources)
-        evidence = {
-            re.sub(r"\s+", "", match.group())
-            for reference in claim.sources for match in QUANTITY.finditer(reference.quote)
-        }
+        if any(field not in sources for field in claim.sources):
+            raise InvalidOutput("Утверждение ссылается на неизвестное исходное поле.")
+        check_sensitive_claim(claim.text, evidence_text)
+        check_identity_and_negation(product, claim.text)
+        for word in re.findall(r"[^\W\d_]+", claim.text):
+            if (re.search(r"[а-яё]", word, re.IGNORECASE)
+                    and re.search(r"[a-z]", word, re.IGNORECASE)
+                    and word.casefold() not in evidence_text.casefold()):
+                raise InvalidOutput(f"Слово «{word}» смешивает алфавиты. Напиши русское слово целиком кириллицей; обозначения товара сохраняй как во входе.")
         for match in QUANTITY.finditer(claim.text):
             quantity = re.sub(r"\s+", "", match.group())
             if quantity not in evidence:
                 raise InvalidOutput("Число или единица не подтверждены цитатой: " + quantity)
-    known_names = {key.casefold() for key in product.specs} | {"производитель"}
+    known_names = {key.casefold() for key, value in product.specs.items() if not unknown(value)} | {"производитель"}
     for characteristic in draft.description_characteristics:
         check_reference(characteristic.source, sources)
         if (characteristic.source.field != "description"
@@ -85,7 +119,7 @@ def check_draft(product: Product, draft: Draft) -> None:
     if draft.seo_title is None or draft.audience is None or draft.tasks is None:
         raise InvalidOutput("Отсутствуют обязательные блоки карточки.")
     title_length = len(draft.seo_title.text)
-    description_length = len(" ".join(c.text for c in draft.seo_description))
+    description_length = len(draft.seo_description.text) if draft.seo_description else 0
     if not 1 <= title_length <= 70 or not 800 <= description_length <= 1200:
         raise InvalidOutput(f"Длины: заголовок {title_length} (1–70), описание {description_length} (800–1200).")
     queries = [c.text.strip().casefold() for c in draft.search_queries]
@@ -104,23 +138,27 @@ def unique_issues(issues: list[MissingData]) -> list[MissingData]:
 
 def characteristics(product: Product, missing: list[MissingData], conflicts: list[Conflict],
                     draft: Draft | None = None) -> list[Characteristic]:
+    extracted = {c.name.casefold(): c.value for c in draft.description_characteristics} if draft else {}
     values = [("manufacturer", "производитель", product.manufacturer)]
     values.extend((f"specs/{key}", key, value) for key, value in product.specs.items())
     result = []
     disputed = {c.field for c in conflicts}
     for field, key, value in values:
+        if unknown(value) and key.casefold() in extracted:
+            value = extracted[key.casefold()]
         state = "conflicting" if field in disputed else ("missing" if unknown(value) else "provided")
         result.append(Characteristic(name=key, value=value if state == "provided" else "данных нет", status=state))
     if draft is not None:
+        existing = {c.name.casefold() for c in result}
         result.extend(Characteristic(name=c.name, value=c.value, status="provided")
-                      for c in draft.description_characteristics)
+                      for c in draft.description_characteristics if c.name.casefold() not in existing)
     for issue in missing:
         if issue.field.startswith("specs/") and issue.field[6:] not in product.specs:
             result.append(Characteristic(name=issue.field[6:], value="данных нет", status="missing"))
     return result
 
 
-async def generate(product: Product, gateway: OpenAIGateway | None) -> GenerationResponse:
+async def generate(product: Product, gateway: OllamaGateway | None) -> GenerationResponse:
     missing = [MissingData(field=field, message="данных нет", question=f"Укажите {label}.", blocking=True)
                for field, label in (("name", "название товара"), ("manufacturer", "производителя"),
                                     ("description", "описание или фрагмент паспорта"))
@@ -132,15 +170,22 @@ async def generate(product: Product, gateway: OpenAIGateway | None) -> Generatio
         return ClarificationResponse(key_characteristics=characteristics(product, missing, []),
                                      missing_data=missing, conflicts=[])
     if gateway is None:
-        raise ServiceError(503, "provider_not_configured", "Задайте OPENAI_API_KEY и OPENAI_MODEL в окружении или .env.")
+        raise ServiceError(503, "provider_not_configured", "Задайте OLLAMA_HOST и OLLAMA_MODEL в окружении или .env.")
     feedback: list[str] = []
+    last_error: InvalidOutput | None = None
     for _ in range(2):
         try:
             draft = await gateway.generate(product, feedback)
             check_draft(product, draft)
             audit = await gateway.audit(product, draft)
-            check_conflicts(audit.conflicts, source_fields(product))
+            check_conflicts(audit.conflicts, product.source_fields())
             all_missing = unique_issues([*missing, *draft.missing_data, *audit.missing_data])
+            extracted_fields = {f"specs/{c.name}" for c in draft.description_characteristics}
+            # Уточнения генератора/аудитора сохраняются; убираем только собственную
+            # пометку null, если извлечённое значение прошло обе проверки.
+            reported_fields = {i.field for i in [*draft.missing_data, *audit.missing_data]}
+            all_missing = [i for i in all_missing
+                           if i.field not in extracted_fields or i.field in reported_fields]
             all_conflicts = list({c.field: c for c in [*draft.conflicts, *audit.conflicts]}.values())
             if all_conflicts or any(i.blocking for i in all_missing):
                 return ClarificationResponse(
@@ -155,7 +200,7 @@ async def generate(product: Product, gateway: OpenAIGateway | None) -> Generatio
                     missing_data=all_missing, conflicts=all_conflicts,
                 )
             title = draft.seo_title.text
-            description = " ".join(c.text for c in draft.seo_description)
+            description = draft.seo_description.text
             return ReadyResponse(
                 seo_title=title, seo_description=description,
                 key_characteristics=characteristics(product, all_missing, [], draft),
@@ -165,5 +210,6 @@ async def generate(product: Product, gateway: OpenAIGateway | None) -> Generatio
                 lengths=Lengths(seo_title=len(title), seo_description=len(description)),
             )
         except InvalidOutput as exc:
+            last_error = exc
             feedback = [str(exc)[:1500]]
-    raise ServiceError(502, "invalid_llm_output", "LLM дважды вернула неподтверждённый или некорректный результат. Карточка не выдана.")
+    raise ServiceError(502, "invalid_llm_output", "LLM дважды вернула неподтверждённый или некорректный результат. Карточка не выдана.") from last_error
