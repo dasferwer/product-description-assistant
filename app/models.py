@@ -40,6 +40,16 @@ class Product(BaseModel):
                for key, value in self.specs.items() if not unknown(value)},
         }
 
+    def canonical_field(self, field: str) -> str:
+        fields = {"name", "manufacturer", "description", "specs",
+                  *(f"specs/{key}" for key in self.specs)}
+        if field in fields:
+            return field
+        matches = [key for key in fields if key.casefold() == field.casefold()]
+        if len(matches) > 1:
+            raise ValueError("Неоднозначное имя исходного поля.")
+        return matches[0] if matches else field
+
     @field_validator("specs")
     @classmethod
     def check_specs(cls, value: dict[str, Scalar]) -> dict[str, Scalar]:
@@ -63,6 +73,7 @@ class Claim(StrictModel):
 
 class DescriptionClaim(Claim):
     text: str = Field(min_length=800, max_length=1200)
+    sources: list[str] = Field(min_length=1, max_length=53)
 
 
 class MissingData(StrictModel):
@@ -74,7 +85,7 @@ class MissingData(StrictModel):
     @field_validator("field")
     @classmethod
     def input_field_only(cls, value: str) -> str:
-        if value not in {"name", "manufacturer", "description"} and not (value.startswith("specs/") and len(value) > 6):
+        if value not in {"name", "manufacturer", "description", "specs"} and not (value.startswith("specs/") and len(value) > 6):
             raise ValueError("Вопрос должен относиться к входным данным товара, а не к полям ответа модели.")
         return value
 
@@ -91,16 +102,23 @@ class ExtractedCharacteristic(StrictModel):
     source: Reference
 
 
-class Draft(StrictModel):
+class CardFacts(StrictModel):
     status: Literal["ready", "needs_clarification"]
     seo_title: Claim | None
-    seo_description: DescriptionClaim | None
-    search_queries: list[Claim] = Field(max_length=5)
     audience: Claim | None
     tasks: Claim | None
     description_characteristics: list[ExtractedCharacteristic] = Field(max_length=20)
     missing_data: list[MissingData] = Field(max_length=30)
     conflicts: list[Conflict] = Field(max_length=20)
+
+
+class GenerationPlan(CardFacts):
+    description_parts: list[str] = Field(max_length=53)
+
+
+class Draft(CardFacts):
+    seo_description: DescriptionClaim | None
+    search_queries: list[Claim] = Field(max_length=5)
 
 
 class Audit(StrictModel):

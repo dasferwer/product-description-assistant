@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 from unittest.mock import AsyncMock
 
@@ -17,6 +18,14 @@ def response_body(text, *, status="completed"):
         "message": {"role": "assistant", "content": text},
         "done": status == "completed", "done_reason": "stop" if status == "completed" else "length",
     }
+
+
+def plan_body(draft):
+    plan = copy.deepcopy(draft)
+    plan.pop("seo_description")
+    plan.pop("search_queries")
+    plan["description_parts"] = ["name"] if plan["status"] == "ready" else []
+    return json.dumps(plan, ensure_ascii=False)
 
 
 def run_gateway(handler, product, *, audit=False, draft=None):
@@ -39,7 +48,7 @@ def test_sdk_serialization_and_parsing(product, draft):
     def handler(request):
         body = json.loads(request.content)
         calls.append(body)
-        return httpx.Response(200, json=response_body(json.dumps(draft, ensure_ascii=False)))
+        return httpx.Response(200, json=response_body(plan_body(draft)))
 
     result = run_gateway(handler, product)
     assert result.seo_title.text == product["name"]
@@ -57,8 +66,10 @@ def test_sdk_serialization_and_parsing(product, draft):
     assert [q.text for q in result.search_queries] == [product["name"], product["name"] + " характеристики", product["name"] + " применение"]
     assert '"maxLength"' not in json.dumps(calls[0]["format"])
     assert calls[0]["options"]["num_ctx"] == 32768
-    assert calls[0]["format"]["$defs"]["DescriptionClaim"]["properties"]["text"]["minLength"] == 800
-    assert calls[0]["format"]["$defs"]["DescriptionClaim"]["properties"]["text"]["enum"] == [product["description"]]
+    assert "seo_description" not in ready["properties"]
+    assert "description/0" in ready["properties"]["description_parts"]["items"]["enum"]
+    assert "description" in calls[0]["format"]["$defs"]["MissingData"]["properties"]["field"]["enum"]
+    assert "specs" in calls[0]["format"]["$defs"]["MissingData"]["properties"]["field"]["enum"]
     assert "specs/диапазон" in calls[0]["format"]["$defs"]["Claim"]["properties"]["sources"]["items"]["enum"]
     system, user = calls[0]["messages"]
     assert system["role"] == "system"
@@ -149,7 +160,7 @@ def test_transient_failure_then_success(product, draft, monkeypatch):
     def handler(request):
         calls.append(request)
         return (httpx.Response(500, json={"error": "temporary"})
-                if len(calls) == 1 else httpx.Response(200, json=response_body(json.dumps(draft))))
+                if len(calls) == 1 else httpx.Response(200, json=response_body(plan_body(draft))))
 
     assert run_gateway(handler, product).status == "ready"
     assert len(calls) == 2
@@ -158,7 +169,7 @@ def test_transient_failure_then_success(product, draft, monkeypatch):
 def test_pydantic_still_rejects_overlong_claim(product, draft):
     draft["seo_title"]["text"] = "А" * 2001
     def handler(request):
-        return httpx.Response(200, json=response_body(json.dumps(draft)))
+        return httpx.Response(200, json=response_body(plan_body(draft)))
     with pytest.raises(InvalidOutput):
         run_gateway(handler, product)
 
@@ -183,6 +194,6 @@ def test_conflict_quotes_require_exact_input_evidence(product):
     }
     def handler(request):
         assert "quote" in json.loads(request.content)["format"]["$defs"]["Reference"]["properties"]
-        return httpx.Response(200, json=response_body(json.dumps(output)))
+        return httpx.Response(200, json=response_body(plan_body(output)))
     with pytest.raises(InvalidOutput):
         run_gateway(handler, product)

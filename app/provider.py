@@ -7,7 +7,8 @@ import httpx
 from ollama import AsyncClient, ResponseError
 from pydantic import BaseModel, ValidationError
 
-from app.models import Audit, Draft, Product, unknown
+from app.description import compose_description, description_facts
+from app.models import Audit, Claim, Draft, GenerationPlan, Product, unknown
 from app.prompts import AUDIT_PROMPT, GENERATION_PROMPT
 
 
@@ -51,12 +52,11 @@ class OllamaGateway:
             definition = schema_json.get("$defs", {}).get(name)
             if definition:
                 definition["properties"]["field"]["enum"] = list(fields)
-        description = fields.get("description", "")
-        if schema is Draft and 800 <= len(description) <= 1200:
-            # Уже пригодный исходный абзац сохраняется без перефразирования.
-            # Модель по-прежнему может выбрать needs_clarification; аудит
-            # проверяет и этот абзац, и остальные сгенерированные блоки.
-            schema_json["$defs"]["DescriptionClaim"]["properties"]["text"]["enum"] = [description]
+        missing = schema_json.get("$defs", {}).get("MissingData")
+        if missing:
+            missing["properties"]["field"]["enum"] = list(dict.fromkeys([
+                *fields, "specs", *(f"specs/{name}" for name in payload.get("unknown_specs", [])),
+            ]))
         for name in ("Claim", "DescriptionClaim"):
             definition = schema_json.get("$defs", {}).get(name)
             if definition:
@@ -69,23 +69,22 @@ class OllamaGateway:
                     "quote": {"type": "string", "minLength": 1},
                 }, "required": ["field", "quote"], "additionalProperties": False,
             }
-        if schema is Draft:
+        if schema is GenerationPlan:
             if any(field.startswith("specs/") for field in fields) and not payload.get("unknown_specs"):
                 schema_json["properties"]["description_characteristics"]["maxItems"] = 0
             definitions = schema_json.pop("$defs")
             ready, clarification = copy.deepcopy(schema_json), copy.deepcopy(schema_json)
             ready["properties"]["status"] = {"const": "ready"}
-            for name in ("seo_title", "seo_description", "audience", "tasks"):
+            for name in ("seo_title", "audience", "tasks"):
                 ready["properties"][name] = next(
                     item for item in ready["properties"][name]["anyOf"] if "$ref" in item)
                 clarification["properties"][name] = {"type": "null"}
             ready["properties"]["conflicts"]["maxItems"] = 0
             clarification["properties"]["status"] = {"const": "needs_clarification"}
-            for variant in (ready, clarification):
-                variant["properties"].pop("search_queries")
-                variant["required"].remove("search_queries")
-            for name in ("description_characteristics",):
-                clarification["properties"][name]["maxItems"] = 0
+            ready["properties"]["description_parts"]["minItems"] = 1
+            ready["properties"]["description_parts"]["items"]["enum"] = list(payload["facts"])
+            clarification["properties"]["description_parts"]["maxItems"] = 0
+            clarification["properties"]["description_characteristics"]["maxItems"] = 0
             schema_json = {"$defs": definitions, "anyOf": [ready, clarification]}
         system = prompt
         user = json.dumps(payload, ensure_ascii=False)
@@ -107,16 +106,6 @@ class OllamaGateway:
                 if not response.done or response.done_reason == "length" or not response.message.content:
                     raise InvalidOutput("empty_or_incomplete_output")
                 raw = json.loads(response.message.content)
-                if schema is Draft and isinstance(raw, dict):
-                    title = raw.get("seo_title")
-                    if raw.get("status") == "ready" and isinstance(title, dict) and isinstance(title.get("text"), str):
-                        text = title["text"]
-                        raw["search_queries"] = [
-                            {"text": query, "sources": ["name", "description"]}
-                            for query in (text, text + " характеристики", text + " применение")
-                        ]
-                    else:
-                        raw["search_queries"] = []
                 return schema.model_validate(raw)
             except ValidationError as exc:
                 details = "; ".join(
@@ -148,16 +137,32 @@ class OllamaGateway:
         raise RuntimeError("unreachable")
 
     async def generate(self, product: Product, feedback: list[str]) -> Draft:
-        return await self._parse(
+        facts = description_facts(product)
+        plan = await self._parse(
             GENERATION_PROMPT,
             {"source_fields": product.source_fields(),
-             "description_length": len(product.description),
+             "facts": {key: {"text": text, "characters": len(text)} for key, (text, _) in facts.items()},
              "unknown_specs": [key for key, value in product.specs.items() if unknown(value)],
              "validation_feedback": feedback},
-            Draft,
+            GenerationPlan,
         )
+        description, queries = None, []
+        if plan.status == "ready":
+            if plan.seo_title is None:
+                raise InvalidOutput("Отсутствует SEO-заголовок.")
+            try:
+                description = compose_description(facts, plan.description_parts)
+            except ValueError as exc:
+                raise InvalidOutput(str(exc)) from exc
+            title = plan.seo_title.text
+            queries = [Claim(text=text, sources=["name", "description"])
+                       for text in (title, title + " характеристики", title + " применение")]
+        return Draft(**plan.model_dump(exclude={"description_parts"}),
+                     seo_description=description, search_queries=queries)
 
     async def audit(self, product: Product, draft: Draft) -> Audit:
         return await self._parse(
-            AUDIT_PROMPT, {"source_fields": product.source_fields(), "draft": draft.model_dump()}, Audit
+            AUDIT_PROMPT, {"source_fields": product.source_fields(),
+                          "unknown_specs": [key for key, value in product.specs.items() if unknown(value)],
+                          "draft": draft.model_dump()}, Audit
         )

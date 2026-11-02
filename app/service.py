@@ -1,10 +1,56 @@
 import re
+from decimal import Decimal
+from typing import TypeVar
 
 from app.models import (
-    Characteristic, ClarificationResponse, Commercial, Conflict, Draft,
+    Audit, Characteristic, ClarificationResponse, Commercial, Conflict, Draft,
     GenerationResponse, Lengths, MissingData, Product, ReadyResponse, Reference, unknown,
 )
 from app.provider import InvalidOutput, OllamaGateway, ServiceError
+
+
+MODEL_COMMAND = re.compile(
+    r"\b(?:игнориру\w*|забудь\w*|отмени\w*).{0,80}\b(?:правил\w*|инструкц\w*|промпт\w*)"
+    r"|\b(?:ignore|disregard|override).{0,80}\b(?:instructions?|rules?|prompts?|previous)"
+    r"|\bслужебн\w+\s+команд\w*"
+    r"|\bинструкц\w+\s+для\s+(?:языков\w+\s+модел\w*|llm|ии|нейросет\w*)"
+    r"|(?:^|\n)\s*(?:system|developer)\s*:"
+    r"|<\|(?:im_start|start_header_id)\|>",
+    re.IGNORECASE,
+)
+
+
+ResultT = TypeVar("ResultT", Draft, Audit)
+
+
+def normalize_references(product: Product, result: ResultT) -> ResultT:
+    result = result.model_copy(deep=True)
+    try:
+        for issue in result.missing_data:
+            issue.field = product.canonical_field(issue.field)
+        for conflict in result.conflicts:
+            conflict.field = product.canonical_field(conflict.field)
+            for source in conflict.sources:
+                source.field = product.canonical_field(source.field)
+        if isinstance(result, Draft):
+            for item in result.description_characteristics:
+                item.name = product.canonical_field("specs/" + item.name)[6:]
+                item.source.field = product.canonical_field(item.source.field)
+    except ValueError as exc:
+        raise InvalidOutput(str(exc)) from exc
+    return result
+
+
+def check_missing(product: Product, issues: list[MissingData]) -> None:
+    for issue in issues:
+        if MODEL_COMMAND.search(issue.message + " " + issue.question):
+            raise InvalidOutput("Вопрос содержит команды для модели вместо уточнения фактов.")
+        if issue.field.startswith("specs/"):
+            key = issue.field[6:]
+            if key in product.specs and not unknown(product.specs[key]):
+                raise InvalidOutput(
+                    f"Поле {issue.field} уже заполнено: используй его значение. "
+                    "Вопрос об отсутствующих условиях задавай с field=specs, не объявляй известное значение отсутствующим.")
 
 
 def check_reference(reference: Reference, sources: dict[str, str]) -> None:
@@ -34,6 +80,49 @@ UNITS = (
     r"кОм|Ом|Ω|л/мин|мл/мин|м/с|об/мин|л|мл|м|m|мин|ч|дней|дня|год|года|лет|min|h|с|s"
 )
 QUANTITY = re.compile(NUMBER + rf"(?:\s*(?:{UNITS})(?!\w))?")
+BOUND = r"[±+−-]?\d+(?:[.,]\d+)?"
+PLAIN_QUANTITY = re.compile(
+    rf"(?P<low>{BOUND})(?:(?:[–−-]|…|\.{{2,3}})(?P<high>{BOUND}))?(?P<unit>{UNITS})?")
+UNIT_ALIASES = {"°С": "°C", "МПа": "MPa", "кПа": "kPa", "Па": "Pa", "бар": "bar",
+                "г": "g", "кг": "kg", "мм": "mm", "см": "cm", "мин": "min", "ч": "h"}
+
+
+NumericSignature = tuple[tuple[tuple[bool, Decimal], ...], str]
+
+
+def numeric_signature(value: str) -> NumericSignature | None:
+    match = PLAIN_QUANTITY.fullmatch(re.sub(r"\s+", "", value))
+    if match is None:
+        return None
+    numbers = tuple((part.startswith("±"), Decimal(part.lstrip("±").replace("−", "-").replace(",", ".")))
+                    for part in (match["low"], match["high"]) if part is not None)
+    unit = match["unit"] or ""
+    return numbers, UNIT_ALIASES.get(unit, unit)
+
+
+def explicit_conflicts(product: Product) -> list[Conflict]:
+    conflicts = []
+    sources = product.source_fields()
+    for key in product.specs:
+        field = f"specs/{key}"
+        if field not in sources:
+            continue
+        expected = numeric_signature(sources[field])
+        if expected is None:
+            continue
+        pattern = rf"(?:^|[.!?\n])\s*{re.escape(key)}\s*[:=—]\s*(.+?)(?=[.!?](?:\s|$)|\n|$)"
+        for match in re.finditer(pattern, product.description, re.IGNORECASE):
+            quote = match[1].strip()
+            actual = numeric_signature(quote)
+            # Сравниваются только простые величины в одной единице: без
+            # пересчёта и предположений об отличающихся условиях измерения.
+            if actual is not None and actual[1] == expected[1] and actual[0] != expected[0]:
+                conflicts.append(Conflict(field=field, question=f"Какое значение характеристики «{key}» верно?",
+                    sources=[Reference(field=field, quote=sources[field]), Reference(field="description", quote=quote)]))
+                break
+    return conflicts
+
+
 SENSITIVE_WORDS = re.compile(
     r"\b(обеспеч|гарант|повыш|сниж|предотвращ|безопас|надеж|эффектив|оптималь|"
     r"сертиф|совместим|агрессив|взрыв|вибрац|коррози|нержав|энерг|"
@@ -76,6 +165,7 @@ def check_identity_and_negation(product: Product, text: str) -> None:
 
 def check_draft(product: Product, draft: Draft) -> None:
     sources = product.source_fields()
+    check_missing(product, draft.missing_data)
     if draft.status == "ready":
         description_length = len(draft.seo_description.text) if draft.seo_description else 0
         if not 800 <= description_length <= 1200:
@@ -85,8 +175,11 @@ def check_draft(product: Product, draft: Draft) -> None:
                          *draft.search_queries, draft.audience, draft.tasks] if c is not None]
     evidence_text = " ".join(f"{field}: {value}" for field, value in sources.items())
     evidence = {re.sub(r"\s+", "", match.group())
-                for value in sources.values() for match in QUANTITY.finditer(value)}
+                for value in [*sources.values(), *product.specs]
+                for match in QUANTITY.finditer(value)}
     for claim in claims:
+        if MODEL_COMMAND.search(claim.text):
+            raise InvalidOutput("В карточку попала команда для модели. Используй только факты о приборе.")
         if any(field not in sources for field in claim.sources):
             raise InvalidOutput("Утверждение ссылается на неизвестное исходное поле.")
         check_sensitive_claim(claim.text, evidence_text)
@@ -100,14 +193,14 @@ def check_draft(product: Product, draft: Draft) -> None:
             quantity = re.sub(r"\s+", "", match.group())
             if quantity not in evidence:
                 raise InvalidOutput("Число или единица не подтверждены цитатой: " + quantity)
-    known_names = {key.casefold() for key, value in product.specs.items() if not unknown(value)} | {"производитель"}
+    known_names = {key for key, value in product.specs.items() if not unknown(value)} | {"производитель"}
     for characteristic in draft.description_characteristics:
         check_reference(characteristic.source, sources)
         if (characteristic.source.field != "description"
                 or characteristic.value not in characteristic.source.quote
-                or characteristic.name.casefold() in known_names):
+                or characteristic.name in known_names):
             raise InvalidOutput("Извлечённая характеристика не подтверждена или дублирует specs.")
-        known_names.add(characteristic.name.casefold())
+        known_names.add(characteristic.name)
     if draft.status == "needs_clarification":
         if not any(i.blocking for i in draft.missing_data) and not draft.conflicts:
             raise InvalidOutput("Не указана причина необходимости уточнения.")
@@ -128,24 +221,26 @@ def check_draft(product: Product, draft: Draft) -> None:
 
 
 def unique_issues(issues: list[MissingData]) -> list[MissingData]:
-    result: dict[str, MissingData] = {}
+    result: dict[tuple[str, str], MissingData] = {}
     for issue in issues:
-        previous = result.get(issue.field)
+        key = (issue.field, issue.question.strip().casefold() if issue.field == "specs" else "")
+        previous = result.get(key)
         if previous is None or issue.blocking:
-            result[issue.field] = issue
+            result[key] = issue
     return list(result.values())
 
 
 def characteristics(product: Product, missing: list[MissingData], conflicts: list[Conflict],
                     draft: Draft | None = None) -> list[Characteristic]:
-    extracted = {c.name.casefold(): c.value for c in draft.description_characteristics} if draft else {}
+    extracted = {c.name: c.value for c in draft.description_characteristics} if draft else {}
     values = [("manufacturer", "производитель", product.manufacturer)]
     values.extend((f"specs/{key}", key, value) for key, value in product.specs.items())
     result = []
-    disputed = {c.field for c in conflicts}
+    disputed = {field for conflict in conflicts
+                for field in [conflict.field, *(ref.field for ref in conflict.sources)]}
     for field, key, value in values:
-        if unknown(value) and key.casefold() in extracted:
-            value = extracted[key.casefold()]
+        if unknown(value) and key in extracted:
+            value = extracted[key]
         state = "conflicting" if field in disputed else ("missing" if unknown(value) else "provided")
         result.append(Characteristic(name=key, value=value if state == "provided" else "данных нет", status=state))
     if draft is not None:
@@ -159,6 +254,14 @@ def characteristics(product: Product, missing: list[MissingData], conflicts: lis
 
 
 async def generate(product: Product, gateway: OllamaGateway | None) -> GenerationResponse:
+    untrusted = [field for field, value in product.source_fields().items()
+                 if MODEL_COMMAND.search(field + " " + value)]
+    if untrusted:
+        roots = sorted({field.split("/", 1)[0] for field in untrusted})
+        return ClarificationResponse(key_characteristics=[], missing_data=[MissingData(
+            field=field, message="Нет проверенных данных: в поле обнаружены команды для LLM.",
+            question="Передайте фактические сведения о приборе без команд для модели.", blocking=True,
+        ) for field in roots], conflicts=[])
     missing = [MissingData(field=field, message="данных нет", question=f"Укажите {label}.", blocking=True)
                for field, label in (("name", "название товара"), ("manufacturer", "производителя"),
                                     ("description", "описание или фрагмент паспорта"))
@@ -166,26 +269,25 @@ async def generate(product: Product, gateway: OllamaGateway | None) -> Generatio
     missing.extend(MissingData(field=f"specs/{key}", message="данных нет",
                                question=f"Уточните характеристику «{key}».", blocking=False)
                    for key, value in product.specs.items() if unknown(value))
-    if any(i.blocking for i in missing):
-        return ClarificationResponse(key_characteristics=characteristics(product, missing, []),
-                                     missing_data=missing, conflicts=[])
+    conflicts = explicit_conflicts(product)
+    if any(i.blocking for i in missing) or conflicts:
+        return ClarificationResponse(key_characteristics=characteristics(product, missing, conflicts),
+                                     missing_data=missing, conflicts=conflicts)
     if gateway is None:
         raise ServiceError(503, "provider_not_configured", "Задайте OLLAMA_HOST и OLLAMA_MODEL в окружении или .env.")
     feedback: list[str] = []
     last_error: InvalidOutput | None = None
     for _ in range(2):
         try:
-            draft = await gateway.generate(product, feedback)
+            draft = normalize_references(product, await gateway.generate(product, feedback))
             check_draft(product, draft)
-            audit = await gateway.audit(product, draft)
+            audit = normalize_references(product, await gateway.audit(product, draft))
             check_conflicts(audit.conflicts, product.source_fields())
+            check_missing(product, audit.missing_data)
             all_missing = unique_issues([*missing, *draft.missing_data, *audit.missing_data])
             extracted_fields = {f"specs/{c.name}" for c in draft.description_characteristics}
-            # Уточнения генератора/аудитора сохраняются; убираем только собственную
-            # пометку null, если извлечённое значение прошло обе проверки.
-            reported_fields = {i.field for i in [*draft.missing_data, *audit.missing_data]}
             all_missing = [i for i in all_missing
-                           if i.field not in extracted_fields or i.field in reported_fields]
+                           if i.field not in extracted_fields]
             all_conflicts = list({c.field: c for c in [*draft.conflicts, *audit.conflicts]}.values())
             if all_conflicts or any(i.blocking for i in all_missing):
                 return ClarificationResponse(
