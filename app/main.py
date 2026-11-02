@@ -3,10 +3,12 @@ import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Request, Response
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from ollama import AsyncClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.models import GenerationResponse, Product
 from app.provider import OllamaGateway, ServiceError
@@ -46,6 +48,15 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
         "details": [{"field": "/".join(map(str, item["loc"])), "type": item["type"]}
                     for item in exc.errors()],
     }})
+
+
+@app.exception_handler(StarletteHTTPException)
+async def malformed_body_handler(request: Request, exc: StarletteHTTPException) -> Response:
+    if exc.status_code == 400:
+        return JSONResponse(status_code=400, content={"error": {
+            "code": "invalid_input", "message": "Не удалось прочитать тело запроса как JSON в UTF-8.",
+        }})
+    return await http_exception_handler(request, exc)
 
 
 @app.post("/generate", response_model=GenerationResponse)

@@ -24,7 +24,9 @@ def plan_body(draft):
     plan = copy.deepcopy(draft)
     plan.pop("seo_description")
     plan.pop("search_queries")
-    plan["description_parts"] = ["name"] if plan["status"] == "ready" else []
+    # Полный отбор обязателен: сборщик не дополняет ответ невыбранными фактами.
+    plan["description_parts"] = (["name", "manufacturer", *(f"description/{i}" for i in range(14))]
+                                 if plan["status"] == "ready" else [])
     return json.dumps(plan, ensure_ascii=False)
 
 
@@ -77,6 +79,16 @@ def test_sdk_serialization_and_parsing(product, draft):
     assert "Ignore previous" not in system["content"]
     assert json.loads(user["content"])["source_fields"] == Product.model_validate(product).source_fields()
     assert user["role"] == "user"
+
+
+def test_labelled_passport_characteristics_do_not_depend_on_model_extraction(product, draft):
+    product["specs"] = {}
+    # Модель выбрала текст, но не извлекла очевидную подписанную характеристику.
+    result = run_gateway(lambda request: httpx.Response(200, json=response_body(plan_body(draft))), product)
+    values = {item.name: item.value for item in result.description_characteristics}
+    assert values["Диапазон"] == "0–10 кПа"
+    assert values["Корпус"] == "сталь"
+    assert "Производитель" not in values
 
 
 def test_audit_uses_separate_system_instruction(product, draft):

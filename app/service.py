@@ -2,22 +2,13 @@ import re
 from decimal import Decimal
 from typing import TypeVar
 
+from app.description import description_facts
 from app.models import (
     Audit, Characteristic, ClarificationResponse, Commercial, Conflict, Draft,
     GenerationResponse, Lengths, MissingData, Product, ReadyResponse, Reference, unknown,
 )
 from app.provider import InvalidOutput, OllamaGateway, ServiceError
-
-
-MODEL_COMMAND = re.compile(
-    r"\b(?:игнориру\w*|забудь\w*|отмени\w*).{0,80}\b(?:правил\w*|инструкц\w*|промпт\w*)"
-    r"|\b(?:ignore|disregard|override).{0,80}\b(?:instructions?|rules?|prompts?|previous)"
-    r"|\bслужебн\w+\s+команд\w*"
-    r"|\bинструкц\w+\s+для\s+(?:языков\w+\s+модел\w*|llm|ии|нейросет\w*)"
-    r"|(?:^|\n)\s*(?:system|developer)\s*:"
-    r"|<\|(?:im_start|start_header_id)\|>",
-    re.IGNORECASE,
-)
+from app.text import has_model_command, is_russian
 
 
 ResultT = TypeVar("ResultT", Draft, Audit)
@@ -43,8 +34,10 @@ def normalize_references(product: Product, result: ResultT) -> ResultT:
 
 def check_missing(product: Product, issues: list[MissingData]) -> None:
     for issue in issues:
-        if MODEL_COMMAND.search(issue.message + " " + issue.question):
+        if has_model_command(issue.message + " " + issue.question):
             raise InvalidOutput("Вопрос содержит команды для модели вместо уточнения фактов.")
+        if issue.field in {"name", "manufacturer"} and not unknown(getattr(product, issue.field)):
+            raise InvalidOutput(f"Поле {issue.field} уже заполнено: не запрашивай его повторно.")
         if issue.field.startswith("specs/"):
             key = issue.field[6:]
             if key in product.specs and not unknown(product.specs[key]):
@@ -111,8 +104,23 @@ def explicit_conflicts(product: Product) -> list[Conflict]:
         if expected is None:
             continue
         pattern = rf"(?:^|[.!?\n])\s*{re.escape(key)}\s*[:=—]\s*(.+?)(?=[.!?](?:\s|$)|\n|$)"
-        for match in re.finditer(pattern, product.description, re.IGNORECASE):
-            quote = match[1].strip()
+        quotes = [match[1].strip() for match in re.finditer(pattern, product.description, re.IGNORECASE)]
+        # В обычной фразе диапазон может стоять после названия датчика.
+        # Сопоставление требует слов из имени параметра и той же единицы;
+        # фразы с явно отличающимися условиями остаются семантической проверке.
+        anchors = {word[:6] for word in re.findall(r"[а-яёa-z]{4,}", key.casefold())
+                   if not word.startswith(("измер", "measure"))}
+        if len(expected[0]) == 2 and anchors:
+            for sentence in re.split(r"(?<=[.!?])\s+(?=[А-ЯЁA-Z])|\n", product.description):
+                lower = sentence.casefold()
+                if (not all(anchor in lower for anchor in anchors)
+                        or re.search(r"\b(?:при проверке|при испытани\w*|для проверки|при услови\w*)", lower)):
+                    continue
+                for quantity in QUANTITY.finditer(sentence):
+                    signature = numeric_signature(quantity.group())
+                    if signature is not None and len(signature[0]) == 2:
+                        quotes.append(quantity.group())
+        for quote in quotes:
             actual = numeric_signature(quote)
             # Сравниваются только простые величины в одной единице: без
             # пересчёта и предположений об отличающихся условиях измерения.
@@ -178,8 +186,10 @@ def check_draft(product: Product, draft: Draft) -> None:
                 for value in [*sources.values(), *product.specs]
                 for match in QUANTITY.finditer(value)}
     for claim in claims:
-        if MODEL_COMMAND.search(claim.text):
+        if has_model_command(claim.text):
             raise InvalidOutput("В карточку попала команда для модели. Используй только факты о приборе.")
+        if not is_russian(claim.text):
+            raise InvalidOutput("Текст карточки должен быть на русском языке; обозначения и единицы сохраняй.")
         if any(field not in sources for field in claim.sources):
             raise InvalidOutput("Утверждение ссылается на неизвестное исходное поле.")
         check_sensitive_claim(claim.text, evidence_text)
@@ -255,7 +265,7 @@ def characteristics(product: Product, missing: list[MissingData], conflicts: lis
 
 async def generate(product: Product, gateway: OllamaGateway | None) -> GenerationResponse:
     untrusted = [field for field, value in product.source_fields().items()
-                 if MODEL_COMMAND.search(field + " " + value)]
+                 if has_model_command(field + " " + value)]
     if untrusted:
         roots = sorted({field.split("/", 1)[0] for field in untrusted})
         return ClarificationResponse(key_characteristics=[], missing_data=[MissingData(
@@ -273,6 +283,14 @@ async def generate(product: Product, gateway: OllamaGateway | None) -> Generatio
     if any(i.blocking for i in missing) or conflicts:
         return ClarificationResponse(key_characteristics=characteristics(product, missing, conflicts),
                                      missing_data=missing, conflicts=conflicts)
+    # Верхняя оценка включает даже повторяющиеся факты и всю пунктуацию.
+    # Если и она меньше 800, никакой отбор исходных фрагментов не даст нужный объём.
+    if sum(len(text) + 2 for text, _ in description_facts(product).values()) + 16 < 800:
+        missing.append(MissingData(field="description", blocking=True,
+            message="Недостаточно подтверждённых фактов для описания на 800 символов: дополнительных данных нет.",
+            question="Передайте более полный фрагмент паспорта с дополнительными характеристиками или условиями применения."))
+        return ClarificationResponse(key_characteristics=characteristics(product, missing, []),
+                                     missing_data=missing, conflicts=[])
     if gateway is None:
         raise ServiceError(503, "provider_not_configured", "Задайте OLLAMA_HOST и OLLAMA_MODEL в окружении или .env.")
     feedback: list[str] = []
@@ -289,6 +307,11 @@ async def generate(product: Product, gateway: OllamaGateway | None) -> Generatio
             all_missing = [i for i in all_missing
                            if i.field not in extracted_fields]
             all_conflicts = list({c.field: c for c in [*draft.conflicts, *audit.conflicts]}.values())
+            # Сначала учитывается отказ проверяющего. Подтверждённые им новые
+            # противоречия/пропуски допустимы как причина отказа, остальные
+            # замечания требуют исправления, в том числе для пустой карточки.
+            if audit.problems or (not audit.supported and not (audit.conflicts or audit.missing_data)):
+                raise InvalidOutput("; ".join(audit.problems) or "Проверка достоверности не пройдена.")
             if all_conflicts or any(i.blocking for i in all_missing):
                 return ClarificationResponse(
                     key_characteristics=characteristics(product, all_missing, all_conflicts),

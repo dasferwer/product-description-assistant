@@ -7,7 +7,7 @@ import httpx
 from ollama import AsyncClient, ResponseError
 from pydantic import BaseModel, ValidationError
 
-from app.description import compose_description, description_facts
+from app.description import compose_description, description_facts, labelled_characteristics
 from app.models import Audit, Claim, Draft, GenerationPlan, Product, unknown
 from app.prompts import AUDIT_PROMPT, GENERATION_PROMPT
 
@@ -157,6 +157,13 @@ class OllamaGateway:
             title = plan.seo_title.text
             queries = [Claim(text=text, sources=["name", "description"])
                        for text in (title, title + " характеристики", title + " применение")]
+            try:
+                labelled = labelled_characteristics(product)
+            except ValueError as exc:
+                raise InvalidOutput(str(exc)) from exc
+            names = {item.name.casefold() for item in labelled}
+            plan.description_characteristics = [*labelled, *(item for item in plan.description_characteristics
+                                                           if item.name.casefold() not in names)][:20]
         return Draft(**plan.model_dump(exclude={"description_parts"}),
                      seo_description=description, search_queries=queries)
 

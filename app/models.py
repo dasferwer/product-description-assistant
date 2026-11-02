@@ -3,6 +3,8 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.text import inspection_text
+
 
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
@@ -10,7 +12,7 @@ class StrictModel(BaseModel):
     @field_validator("*", mode="after")
     @classmethod
     def reject_blank_strings(cls, value):
-        if isinstance(value, str) and not value.strip():
+        if isinstance(value, str) and not inspection_text(value).strip():
             raise ValueError("Строка не должна быть пустой.")
         return value
 
@@ -19,7 +21,7 @@ Scalar = str | int | float | bool | None
 
 
 def unknown(value: Scalar) -> bool:
-    return value is None or (isinstance(value, str) and value.strip().casefold() in {
+    return value is None or (isinstance(value, str) and inspection_text(value).strip().casefold() in {
         "", "данных нет", "нет данных", "не указано", "n/a", "-",
     })
 
@@ -54,7 +56,7 @@ class Product(BaseModel):
     @classmethod
     def check_specs(cls, value: dict[str, Scalar]) -> dict[str, Scalar]:
         for key, item in value.items():
-            if not key.strip() or len(key) > 120:
+            if not inspection_text(key).strip() or len(key) > 120:
                 raise ValueError("Название характеристики должно содержать от 1 до 120 символов.")
             if isinstance(item, str) and len(item) > 1000:
                 raise ValueError("Значение характеристики длиннее 1000 символов.")

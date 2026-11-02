@@ -1,6 +1,6 @@
 import re
 
-from app.models import DescriptionClaim, Product
+from app.models import DescriptionClaim, ExtractedCharacteristic, Product, Reference, unknown
 
 
 def description_facts(product: Product) -> dict[str, tuple[str, str]]:
@@ -9,7 +9,10 @@ def description_facts(product: Product) -> dict[str, tuple[str, str]]:
         "name": (product.name, "name"),
         "manufacturer": ("Производитель — " + product.manufacturer, "manufacturer"),
     }
-    sentences = re.split(r"(?<=[.!?])\s+(?=[А-ЯЁA-Z])", product.description.strip())
+    # Перенос строки или новая подписанная характеристика отделяют факт.
+    # Точка с запятой внутри условий погрешности/ресурса не отделяет их от значения.
+    sentences = re.split(r"\r?\n|(?<=[.!?])\s+(?=[А-ЯЁA-Z])|;\s+(?=[^;:\n]{1,120}:\s)",
+                         product.description.strip())
     for index, sentence in enumerate(sentences):
         if sentence:
             facts[f"description/{index}"] = (sentence, "description")
@@ -17,6 +20,27 @@ def description_facts(product: Product) -> dict[str, tuple[str, str]]:
         if field.startswith("specs/"):
             facts[field] = (field[6:] + ": " + value, field)
     return facts
+
+
+def labelled_characteristics(product: Product) -> list[ExtractedCharacteristic]:
+    result = []
+    for text, source in description_facts(product).values():
+        if source != "description":
+            continue
+        match = re.fullmatch(r"([^:;.!?\n]{1,120}):\s*(.+)", text)
+        if match is None:
+            continue
+        name, value = match[1].strip(), match[2].rstrip(".").strip()
+        field = product.canonical_field("specs/" + name)
+        name = field[6:]
+        if (name.casefold() in {"производитель", "изготовитель", "название", "manufacturer", "name"}
+                or (name in product.specs and not unknown(product.specs[name])) or unknown(value)):
+            continue
+        result.append(ExtractedCharacteristic(name=name, value=value,
+                      source=Reference(field="description", quote=text)))
+        if len(result) == 20:
+            break
+    return result
 
 
 def compose_description(facts: dict[str, tuple[str, str]], priority: list[str]) -> DescriptionClaim:
@@ -37,7 +61,7 @@ def compose_description(facts: dict[str, tuple[str, str]], priority: list[str]) 
 
     selected: list[str] = []
     text = ""
-    for key in dict.fromkeys([*priority, *facts]):
+    for key in dict.fromkeys(priority):
         sentence, _ = facts[key]
         if sentence.casefold() in text.casefold():
             continue
