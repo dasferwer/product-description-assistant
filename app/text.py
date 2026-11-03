@@ -22,7 +22,14 @@ MODEL_COMMAND = re.compile(
 
 
 def has_model_command(text: str) -> bool:
-    return MODEL_COMMAND.search(inspection_text(text)) is not None
+    text = inspection_text(text)
+    # Контекст управления ответом не является характеристикой прибора;
+    # проверка не зависит от конкретного глагола («допиши», «перенеси» и т.п.).
+    output_target = re.search(
+        r"\b(?:в\s+(?:(?:итогов\w*|готов\w*|сво\w*|тво\w*)\s+)?(?:ответ\w*|описан\w*|текст\w*|карточк\w*)"
+        r"|seo[-\s]?(?:описан\w*|заголов\w*))\b", text, re.IGNORECASE)
+    output_content = re.search(r"\b(?:фраз\w*|маркер\w*|слов[оа]\w*|контрольн\w*)\b", text, re.IGNORECASE)
+    return MODEL_COMMAND.search(text) is not None or bool(output_target and output_content)
 
 
 def is_russian(text: str) -> bool:

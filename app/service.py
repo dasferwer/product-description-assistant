@@ -2,12 +2,12 @@ import re
 from decimal import Decimal
 from typing import TypeVar
 
-from app.description import description_facts
+from app.description import description_facts, labelled_characteristics
 from app.models import (
     Audit, Characteristic, ClarificationResponse, Commercial, Conflict, Draft,
     GenerationResponse, Lengths, MissingData, Product, ReadyResponse, Reference, unknown,
 )
-from app.provider import InvalidOutput, OllamaGateway, ServiceError
+from app.provider import InvalidOutput, OllamaGateway, ServiceError, SourceClarification
 from app.text import has_model_command, is_russian
 
 
@@ -24,9 +24,15 @@ def normalize_references(product: Product, result: ResultT) -> ResultT:
             for source in conflict.sources:
                 source.field = product.canonical_field(source.field)
         if isinstance(result, Draft):
+            extracted = []
             for item in result.description_characteristics:
                 item.name = product.canonical_field("specs/" + item.name)[6:]
                 item.source.field = product.canonical_field(item.source.field)
+                if any(previous.name.casefold() == item.name.casefold()
+                       and equivalent_values(previous.value, item.value) for previous in extracted):
+                    continue
+                extracted.append(item)
+            result.description_characteristics = extracted
     except ValueError as exc:
         raise InvalidOutput(str(exc)) from exc
     return result
@@ -93,6 +99,13 @@ def numeric_signature(value: str) -> NumericSignature | None:
     return numbers, UNIT_ALIASES.get(unit, unit)
 
 
+def equivalent_values(first: str, second: str) -> bool:
+    if first == second:
+        return True
+    first_signature, second_signature = numeric_signature(first), numeric_signature(second)
+    return first_signature is not None and first_signature == second_signature
+
+
 def explicit_conflicts(product: Product) -> list[Conflict]:
     conflicts = []
     sources = product.source_fields()
@@ -105,21 +118,27 @@ def explicit_conflicts(product: Product) -> list[Conflict]:
             continue
         pattern = rf"(?:^|[.!?\n])\s*{re.escape(key)}\s*[:=—]\s*(.+?)(?=[.!?](?:\s|$)|\n|$)"
         quotes = [match[1].strip() for match in re.finditer(pattern, product.description, re.IGNORECASE)]
-        # В обычной фразе диапазон может стоять после названия датчика.
-        # Сопоставление требует слов из имени параметра и той же единицы;
-        # фразы с явно отличающимися условиями остаются семантической проверке.
+        # Каждая величина связывается с описанием непосредственно перед ней,
+        # а не со всеми параметрами предложения. Иначе диапазон хранения мог
+        # ошибочно подменять измерительный диапазон того же прибора.
         anchors = {word[:6] for word in re.findall(r"[а-яёa-z]{4,}", key.casefold())
                    if not word.startswith(("измер", "measure"))}
         if len(expected[0]) == 2 and anchors:
             for sentence in re.split(r"(?<=[.!?])\s+(?=[А-ЯЁA-Z])|\n", product.description):
-                lower = sentence.casefold()
-                if (not all(anchor in lower for anchor in anchors)
-                        or re.search(r"\b(?:при проверке|при испытани\w*|для проверки|при услови\w*)", lower)):
-                    continue
+                previous_range_end = 0
                 for quantity in QUANTITY.finditer(sentence):
                     signature = numeric_signature(quantity.group())
-                    if signature is not None and len(signature[0]) == 2:
-                        quotes.append(quantity.group())
+                    if signature is None or len(signature[0]) != 2:
+                        continue
+                    context = sentence[previous_range_end:quantity.start()].casefold()
+                    previous_range_end = quantity.end()
+                    if (not all(anchor in context for anchor in anchors)
+                            or re.search(r"\b(?:при проверке|при испытани\w*|для проверки|при услови\w*)", context)):
+                        continue
+                    other_conditions = ("хран", "транспорт", "эксплуат", "рабоч")
+                    if any(stem in context and stem not in key.casefold() for stem in other_conditions):
+                        continue
+                    quotes.append(quantity.group())
         for quote in quotes:
             actual = numeric_signature(quote)
             # Сравниваются только простые величины в одной единице: без
@@ -128,6 +147,18 @@ def explicit_conflicts(product: Product) -> list[Conflict]:
                 conflicts.append(Conflict(field=field, question=f"Какое значение характеристики «{key}» верно?",
                     sources=[Reference(field=field, quote=sources[field]), Reference(field="description", quote=quote)]))
                 break
+    # Повтор одной подписи с разными значениями в самом паспорте тоже
+    # требует уточнения, даже если specs пуст и сравнивать его не с чем.
+    previous = {}
+    for item in labelled_characteristics(product, limit=None):
+        name = item.name.casefold()
+        if name in previous and not equivalent_values(previous[name].value, item.value):
+            first = previous[name]
+            conflicts.append(Conflict(field="description",
+                question=f"Уточните значения и условия характеристики «{item.name}» в описании.",
+                sources=[first.source, item.source]))
+        else:
+            previous[name] = item
     return conflicts
 
 
@@ -266,6 +297,7 @@ def characteristics(product: Product, missing: list[MissingData], conflicts: lis
 async def generate(product: Product, gateway: OllamaGateway | None) -> GenerationResponse:
     untrusted = [field for field, value in product.source_fields().items()
                  if has_model_command(field + " " + value)]
+    untrusted.extend("specs/" + key for key in product.specs if has_model_command(key))
     if untrusted:
         roots = sorted({field.split("/", 1)[0] for field in untrusted})
         return ClarificationResponse(key_characteristics=[], missing_data=[MissingData(
@@ -279,7 +311,11 @@ async def generate(product: Product, gateway: OllamaGateway | None) -> Generatio
     missing.extend(MissingData(field=f"specs/{key}", message="данных нет",
                                question=f"Уточните характеристику «{key}».", blocking=False)
                    for key, value in product.specs.items() if unknown(value))
-    conflicts = explicit_conflicts(product)
+    try:
+        conflicts = explicit_conflicts(product)
+    except ValueError as exc:
+        raise ServiceError(422, "invalid_input",
+                           "Проверьте названия характеристик: исходные поля нельзя однозначно сопоставить.") from exc
     if any(i.blocking for i in missing) or conflicts:
         return ClarificationResponse(key_characteristics=characteristics(product, missing, conflicts),
                                      missing_data=missing, conflicts=conflicts)
@@ -334,6 +370,15 @@ async def generate(product: Product, gateway: OllamaGateway | None) -> Generatio
                 missing_data=all_missing, conflicts=[],
                 lengths=Lengths(seo_title=len(title), seo_description=len(description)),
             )
+        except SourceClarification as exc:
+            insufficient = exc.reason == "insufficient"
+            return ClarificationResponse(key_characteristics=[], missing_data=[MissingData(
+                field=field, blocking=True,
+                message=("Недостаточно проверенных фактов для полного описания; дополнительных данных нет."
+                         if insufficient else "Нужно отделить фактические данные о приборе от редакционных указаний."),
+                question=("Передайте более полный фрагмент паспорта с дополнительными характеристиками или условиями применения."
+                          if insufficient else "Передайте фактические сведения о приборе без указаний автору карточки или модели."),
+            ) for field in exc.fields], conflicts=[])
         except InvalidOutput as exc:
             last_error = exc
             feedback = [str(exc)[:1500]]

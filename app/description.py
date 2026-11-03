@@ -22,9 +22,10 @@ def description_facts(product: Product) -> dict[str, tuple[str, str]]:
     return facts
 
 
-def labelled_characteristics(product: Product) -> list[ExtractedCharacteristic]:
-    result = []
-    for text, source in description_facts(product).values():
+def labelled_characteristics(product: Product, *, limit: int | None = 20,
+                             facts: dict[str, tuple[str, str]] | None = None) -> list[ExtractedCharacteristic]:
+    result, seen = [], set()
+    for text, source in (description_facts(product) if facts is None else facts).values():
         if source != "description":
             continue
         match = re.fullmatch(r"([^:;.!?\n]{1,120}):\s*(.+)", text)
@@ -33,14 +34,17 @@ def labelled_characteristics(product: Product) -> list[ExtractedCharacteristic]:
         name, value = match[1].strip(), match[2].rstrip(".").strip()
         field = product.canonical_field("specs/" + name)
         name = field[6:]
-        if (name.casefold() in {"производитель", "изготовитель", "название", "manufacturer", "name"}
+        if (name.casefold() in {"производитель", "изготовитель", "название", "manufacturer", "name",
+                               "примечание", "примечания", "комментарий", "комментарии", "note", "notes"}
                 or (name in product.specs and not unknown(product.specs[name])) or unknown(value)):
             continue
+        identity = (name.casefold(), value)
+        if identity in seen:
+            continue
+        seen.add(identity)
         result.append(ExtractedCharacteristic(name=name, value=value,
                       source=Reference(field="description", quote=text)))
-        if len(result) == 20:
-            break
-    return result
+    return result if limit is None else result[:limit]
 
 
 def compose_description(facts: dict[str, tuple[str, str]], priority: list[str]) -> DescriptionClaim:

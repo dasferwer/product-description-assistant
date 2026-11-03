@@ -100,8 +100,17 @@ class Conflict(StrictModel):
 
 class ExtractedCharacteristic(StrictModel):
     name: str = Field(min_length=1, max_length=120)
-    value: str = Field(min_length=1, max_length=1000)
+    value: str = Field(min_length=1, max_length=20000)
     source: Reference
+
+
+class SourceDecision(StrictModel):
+    fact_id: str = Field(min_length=1, max_length=200)
+    kind: Literal["product_data", "operating_instruction", "editorial_instruction", "unrelated", "uncertain"]
+
+
+class SourceReview(StrictModel):
+    decisions: list[SourceDecision] = Field(max_length=200)
 
 
 class CardFacts(StrictModel):
