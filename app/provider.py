@@ -114,7 +114,13 @@ class OllamaGateway:
                             stream=False,
                             think=False,
                         )
-                    except (ValueError, TypeError, RecursionError) as exc:
+                    except (ValueError, TypeError, RecursionError, AttributeError) as exc:
+                        # ResponseError SDK может сам упасть при разборе тела ошибки.
+                        # HTTP-статус сохраняется в контексте исходного исключения.
+                        if isinstance(exc.__context__, httpx.HTTPStatusError):
+                            raise exc.__context__ from exc
+                        if isinstance(exc, AttributeError):
+                            raise
                         # SDK декодирует HTTP JSON и строит ChatResponse внутри chat.
                         # Ошибки формы внешней оболочки не являются сетевыми сбоями.
                         raise InvalidOutput("Нарушен формат ответа LLM-сервера.") from exc
@@ -131,8 +137,9 @@ class OllamaGateway:
                     for error in exc.errors()[:8]
                 )
                 raise InvalidOutput("Нарушена схема ответа: " + details) from exc
-            except (ResponseError, httpx.RequestError, ConnectionError, TimeoutError) as exc:
-                status = getattr(exc, "status_code", None)
+            except (ResponseError, httpx.HTTPStatusError, httpx.RequestError, ConnectionError, TimeoutError) as exc:
+                status = (exc.response.status_code if isinstance(exc, httpx.HTTPStatusError)
+                          else getattr(exc, "status_code", None))
                 transient = (
                     isinstance(exc, (httpx.TransportError, ConnectionError, TimeoutError))
                     or status in {408, 409, 429}

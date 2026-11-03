@@ -3,6 +3,18 @@ import re
 from app.models import DescriptionClaim, ExtractedCharacteristic, Product, Reference, unknown
 
 
+def value_conditions(value: str) -> tuple[str, str | None]:
+    """Значение и явно записанные условия; исходный текст не изменяется."""
+    match = re.search(r"(?:\s+|\s*\()(?:при|для|в\s+(?:условиях|диапазоне|режиме)|во?\s+время)\b\s*",
+                      value, re.IGNORECASE)
+    if match and value[:match.start()].strip() and value[match.end():].strip():
+        condition = value[match.end():].strip()
+        if "(" in match.group() and condition.endswith(")"):
+            condition = condition[:-1].strip()
+        return value[:match.start()].strip(" ;"), condition
+    return value, None
+
+
 def description_facts(product: Product) -> dict[str, tuple[str, str]]:
     """Целые исходные предложения и значения; второй элемент — поле-источник."""
     facts = {

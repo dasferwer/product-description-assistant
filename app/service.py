@@ -2,7 +2,7 @@ import re
 from decimal import Decimal
 from typing import TypeVar
 
-from app.description import description_facts, labelled_characteristics
+from app.description import description_facts, labelled_characteristics, value_conditions
 from app.models import (
     Audit, Characteristic, ClarificationResponse, Commercial, Conflict, Draft,
     GenerationResponse, Lengths, MissingData, Product, ReadyResponse, Reference, unknown,
@@ -99,11 +99,35 @@ def numeric_signature(value: str) -> NumericSignature | None:
     return numbers, UNIT_ALIASES.get(unit, unit)
 
 
+def condition_signature(value: str) -> NumericSignature | str | None:
+    _, condition = value_conditions(value)
+    if condition is None:
+        return None
+    # Регистр неизвестных единиц/кодов не меняется: MPa и mPa различаются.
+    return numeric_signature(condition) or re.sub(r"\s+", "", condition)
+
+
 def equivalent_values(first: str, second: str) -> bool:
     if first == second:
         return True
-    first_signature, second_signature = numeric_signature(first), numeric_signature(second)
-    return first_signature is not None and first_signature == second_signature
+    if condition_signature(first) != condition_signature(second):
+        return False
+    first_base, _ = value_conditions(first)
+    second_base, _ = value_conditions(second)
+    first_signature, second_signature = numeric_signature(first_base), numeric_signature(second_base)
+    return first_base == second_base or (first_signature is not None and first_signature == second_signature)
+
+
+def conflicting_numeric_values(first: str, second: str) -> bool:
+    first_condition, second_condition = condition_signature(first), condition_signature(second)
+    if first_condition is not None and second_condition is not None and first_condition != second_condition:
+        return False
+    first_signature = numeric_signature(value_conditions(first)[0])
+    second_signature = numeric_signature(value_conditions(second)[0])
+    # Только доказуемое числовое расхождение в одной единице. Списки назначений,
+    # сложные формулировки и разные единицы требуют семантической проверки.
+    return (first_signature is not None and second_signature is not None
+            and first_signature[1] == second_signature[1] and first_signature[0] != second_signature[0])
 
 
 def explicit_conflicts(product: Product) -> list[Conflict]:
@@ -152,13 +176,24 @@ def explicit_conflicts(product: Product) -> list[Conflict]:
     previous = {}
     for item in labelled_characteristics(product, limit=None):
         name = item.name.casefold()
-        if name in previous and not equivalent_values(previous[name].value, item.value):
-            first = previous[name]
-            conflicts.append(Conflict(field="description",
-                question=f"Уточните значения и условия характеристики «{item.name}» в описании.",
-                sources=[first.source, item.source]))
+        signature = numeric_signature(value_conditions(item.value)[0])
+        if signature is None:
+            continue
+        scope = condition_signature(item.value)
+        contexts = previous.setdefault((name, signature[1]), {})
+        if scope in contexts:
+            comparable = [contexts[scope]]
+        elif scope is None:
+            comparable = list(contexts.values())
         else:
-            previous[name] = item
+            comparable = [contexts[None]] if None in contexts else []
+        for first in comparable:
+            if conflicting_numeric_values(first.value, item.value):
+                conflicts.append(Conflict(field="description",
+                    question=f"Уточните значения и условия характеристики «{item.name}» в описании.",
+                    sources=[first.source, item.source]))
+                break
+        contexts.setdefault(scope, item)
     return conflicts
 
 
@@ -234,14 +269,18 @@ def check_draft(product: Product, draft: Draft) -> None:
             quantity = re.sub(r"\s+", "", match.group())
             if quantity not in evidence:
                 raise InvalidOutput("Число или единица не подтверждены цитатой: " + quantity)
-    known_names = {key for key, value in product.specs.items() if not unknown(value)} | {"производитель"}
+    known_names = {key.casefold() for key, value in product.specs.items() if not unknown(value)} | {"производитель"}
+    seen_values = {}
     for characteristic in draft.description_characteristics:
         check_reference(characteristic.source, sources)
         if (characteristic.source.field != "description"
                 or characteristic.value not in characteristic.source.quote
-                or characteristic.name in known_names):
+                or characteristic.name.casefold() in known_names):
             raise InvalidOutput("Извлечённая характеристика не подтверждена или дублирует specs.")
-        known_names.add(characteristic.name)
+        previous_values = seen_values.setdefault(characteristic.name.casefold(), [])
+        if any(conflicting_numeric_values(value, characteristic.value) for value in previous_values):
+            raise InvalidOutput("Разные значения одной характеристики должны сохранять явно различные условия.")
+        previous_values.append(characteristic.value)
     if draft.status == "needs_clarification":
         if not any(i.blocking for i in draft.missing_data) and not draft.conflicts:
             raise InvalidOutput("Не указана причина необходимости уточнения.")
@@ -273,15 +312,20 @@ def unique_issues(issues: list[MissingData]) -> list[MissingData]:
 
 def characteristics(product: Product, missing: list[MissingData], conflicts: list[Conflict],
                     draft: Draft | None = None) -> list[Characteristic]:
-    extracted = {c.name: c.value for c in draft.description_characteristics} if draft else {}
+    extracted = {}
+    if draft:
+        for item in draft.description_characteristics:
+            extracted.setdefault(item.name.casefold(), []).append(item.value)
     values = [("manufacturer", "производитель", product.manufacturer)]
     values.extend((f"specs/{key}", key, value) for key, value in product.specs.items())
     result = []
     disputed = {field for conflict in conflicts
                 for field in [conflict.field, *(ref.field for ref in conflict.sources)]}
     for field, key, value in values:
-        if unknown(value) and key in extracted:
-            value = extracted[key]
+        if unknown(value) and key.casefold() in extracted and field not in disputed:
+            result.extend(Characteristic(name=key, value=entry, status="provided")
+                          for entry in extracted[key.casefold()])
+            continue
         state = "conflicting" if field in disputed else ("missing" if unknown(value) else "provided")
         result.append(Characteristic(name=key, value=value if state == "provided" else "данных нет", status=state))
     if draft is not None:
